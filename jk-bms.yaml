@@ -1,0 +1,574 @@
+substitutions:
+  # Токен и chat_id теперь хранятся в secrets.yaml:
+  #   tg_token: "123456:ABC..."
+  #   tg_chat_id: "538843133"
+  tg_token: !secret tg_token
+  tg_chat_id: !secret tg_chat_id
+  # Пороги уведомлений
+  soc_low: "20"        # % - предупреждение о низком заряде
+  soc_low_reset: "25"  # % - после этого сбрасываем предупреждение
+  soc_full: "99"       # % - сообщение "заряжена"
+  soc_full_reset: "95" # % - после этого снова ждём 99%
+  mos_hot: "60"        # °C - перегрев MOSFET
+  bat_hot: "50"        # °C - перегрев датчиков батареи
+  delta_max: "0.15"    # В - разброс ячеек
+  # Ёмкость для расчёта времени заряда/разряда (А·ч).
+  # Впиши сюда значение, которое выставлено в настройках BMS.
+  capacity_ah: "280"
+
+esphome:
+  name: jk-bms
+  on_boot:
+    priority: -100
+    then:
+      - delay: 30s
+      - script.execute:
+          id: send_tg
+          msg: "✅ ESP32 запущена. Кнопка «📊 Опросить BMS» внизу покажет все данные."
+
+esp32:
+  variant: esp32
+  framework:
+    type: esp-idf
+
+external_components:
+  - source: github://syssi/esphome-jk-bms@main
+    refresh: 0s
+
+logger:
+  level: INFO
+
+# Нужен только для просмотра логов по Wi-Fi. Home Assistant не требуется.
+api:
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  use_address: 192.168.0.101
+  reboot_timeout: 0s
+
+http_request:
+  verify_ssl: false
+  timeout: 15s
+  watchdog_timeout: 25s
+
+uart:
+  - id: uart_0
+    baud_rate: 115200
+    tx_pin: GPIO25
+    rx_pin: GPIO26
+    rx_buffer_size: 384
+
+jk_modbus:
+  - id: modbus0
+    uart_id: uart_0
+    rx_timeout: 50ms
+
+jk_bms:
+  - id: bms0
+    jk_modbus_id: modbus0
+    update_interval: 10s
+
+globals:
+  - id: last_ok
+    type: uint32_t
+    initial_value: '0'
+  # следующий update_id для getUpdates
+  - id: tg_offset
+    type: int
+    initial_value: '0'
+  # true до первого успешного опроса: старые сообщения не обрабатываем
+  - id: tg_first
+    type: bool
+    initial_value: 'true'
+  # флаги, чтобы уведомления не повторялись
+  - id: soc_init
+    type: bool
+    initial_value: 'false'
+  - id: f_low
+    type: bool
+    initial_value: 'false'
+  - id: f_full
+    type: bool
+    initial_value: 'false'
+  - id: f_mos_hot
+    type: bool
+    initial_value: 'false'
+  - id: f_t1_hot
+    type: bool
+    initial_value: 'false'
+  - id: f_t2_hot
+    type: bool
+    initial_value: 'false'
+  - id: f_delta
+    type: bool
+    initial_value: 'false'
+  # последний текст ошибок BMS, чтобы не слать одно и то же
+  - id: last_err
+    type: std::string
+    initial_value: '""'
+
+script:
+  # Отправка текста в Telegram (с постоянной кнопкой внизу чата)
+  - id: send_tg
+    mode: queued
+    parameters:
+      msg: string
+    then:
+      - http_request.post:
+          url: !lambda |-
+            return std::string("https://api.telegram.org/bot") + "${tg_token}" + "/sendMessage?chat_id=" + "${tg_chat_id}";
+          request_headers:
+            Content-Type: application/json
+          json: |-
+            root["text"] = msg;
+            JsonObject rm = root["reply_markup"].to<JsonObject>();
+            JsonArray kb = rm["keyboard"].to<JsonArray>();
+            JsonArray row = kb.add<JsonArray>();
+            JsonObject btn1 = row.add<JsonObject>();
+            btn1["text"] = "📊 Опросить BMS";
+            rm["resize_keyboard"] = true;
+            rm["is_persistent"] = true;
+          on_response:
+            then:
+              - lambda: |-
+                  ESP_LOGI("tg", "sendMessage ответ: %d", response->status_code);
+
+  # Полный отчёт по BMS (только по кнопке или команде)
+  - id: send_status
+    mode: single
+    then:
+      - script.execute:
+          id: send_tg
+          msg: !lambda |-
+            if (!id(bms_online).state || isnan(id(soc).state)) {
+              return std::string("⚠️ Нет связи с BMS");
+            }
+            // режим определяем по направлению тока, а не по состоянию MOSFET
+            float avg = id(cur_avg).state;
+            const char *mode = "💤 покой";
+            if (avg >= 0.2f) mode = "🔺 заряд";
+            else if (avg <= -0.2f) mode = "🔻 разряд";
+            // убираем "-0.0" при нулевом токе и мощности
+            float amp = id(cur).state;
+            if (isnan(amp) || fabsf(amp) < 0.05f) amp = 0;
+            float watt = id(pwr).state;
+            if (isnan(watt) || fabsf(watt) < 0.5f) watt = 0;
+            // шкала заряда из 10 делений
+            float pct = id(soc).state;
+            int filled = (int) roundf(pct / 10.0f);
+            if (filled < 0) filled = 0;
+            if (filled > 10) filled = 10;
+            std::string bar;
+            for (int k = 0; k < 10; k++) bar += (k < filled) ? "▰" : "▱";
+            // время показываем только то, что актуально сейчас
+            std::string tline;
+            if (avg >= 0.2f) tline = "⏳ до полного заряда: " + id(t_full).state;
+            else if (avg <= -0.2f) tline = "⏳ до разряда: " + id(t_empty).state;
+            else tline = "⏳ нет ни заряда, ни нагрузки";
+            std::string err = id(errors_txt).state.empty() ? std::string("✅ ошибок нет") : "🚨 " + id(errors_txt).state;
+            // цветная метка ячейки: 🔴 максимальная, 🔵 минимальная, ⚪ остальные
+            auto mk = [](int n) -> const char * {
+              if (n == (int) id(cmax_n).state) return "🔴";
+              if (n == (int) id(cmin_n).state) return "🔵";
+              return "⚪";
+            };
+            char buf[900];
+            snprintf(buf, sizeof(buf),
+              "🛰 JK-BMS · 4S LiFePO4\n"
+              "━━━━━━━━━━━━━━\n"
+              "🔋 %.0f%% %s · %.0f/%.0f А·ч\n"
+              "⚡ %.2f В · %.1f А · %.0f Вт\n"
+              "%s · баланс: %s\n"
+              "━━━━━━━━━━━━━━\n"
+              "%s\n"
+              "━━━━━━━━━━━━━━\n"
+              "%s1  %.3f    %s2  %.3f\n"
+              "%s3  %.3f    %s4  %.3f\n"
+              "Δ %.3f В · ср. %.3f В\n"
+              "━━━━━━━━━━━━━━\n"
+              "🌡 MOS %.0f° · T1 %.0f° · T2 %.0f°\n"
+              "♻️ %.0f цикл. · %.0f А·ч · ⏱ %s\n"
+              "%s",
+              pct, bar.c_str(), pct * ${capacity_ah} / 100.0f, (float) ${capacity_ah},
+              id(vtotal).state, amp, watt,
+              mode, id(st_balancing).state ? "идёт" : "нет",
+              tline.c_str(),
+              mk(1), id(cv1).state, mk(2), id(cv2).state,
+              mk(3), id(cv3).state, mk(4), id(cv4).state,
+              id(delta).state, id(cavg).state,
+              id(mos_t).state, id(t1).state, id(t2).state,
+              id(cycles).state, id(cycles_cap).state, id(runtime_fmt).state.c_str(),
+              err.c_str());
+            return std::string(buf);
+
+interval:
+  # Опрос Telegram: нажата ли кнопка / отправлена команда
+  - interval: 6s
+    then:
+      - if:
+          condition:
+            wifi.connected:
+          then:
+            - http_request.get:
+                url: !lambda |-
+                  return std::string("https://api.telegram.org/bot") + "${tg_token}" + "/getUpdates?timeout=0&limit=3&offset=" + std::to_string(id(tg_offset));
+                capture_response: true
+                max_response_buffer_size: 4096
+                on_response:
+                  then:
+                    - lambda: |-
+                        if (response->status_code != 200) {
+                          ESP_LOGW("tg", "getUpdates ответ: %d", response->status_code);
+                          return;
+                        }
+                        bool want_status = false;
+                        json::parse_json(body, [&want_status](JsonObject root) -> bool {
+                          if (!root["ok"].as<bool>()) return false;
+                          for (JsonObject upd : root["result"].as<JsonArray>()) {
+                            int uid = upd["update_id"] | 0;
+                            if (uid >= id(tg_offset)) id(tg_offset) = uid + 1;
+                            // только сообщения из твоего чата
+                            long long chat = upd["message"]["chat"]["id"] | 0LL;
+                            if (std::to_string(chat) != "${tg_chat_id}") continue;
+                            const char *text = upd["message"]["text"] | "";
+                            if (strstr(text, "Опросить") != nullptr ||
+                                strncmp(text, "/status", 7) == 0 ||
+                                strncmp(text, "/start", 6) == 0) {
+                              want_status = true;
+                            }
+                          }
+                          return true;
+                        });
+                        // при первом опросе пропускаем старые сообщения
+                        if (id(tg_first)) {
+                          id(tg_first) = false;
+                          return;
+                        }
+                        if (want_status) {
+                          id(send_status).execute();
+                        }
+
+binary_sensor:
+  - platform: template
+    id: bms_online
+    name: "online status"
+    lambda: |-
+      if (id(last_ok) == 0) return false;
+      return (millis() - id(last_ok)) < 120000;
+    on_press:
+      then:
+        - script.execute:
+            id: send_tg
+            msg: "✅ Связь с BMS установлена"
+    on_release:
+      then:
+        - script.execute:
+            id: send_tg
+            msg: "⚠️ Связь с BMS потеряна"
+
+  - platform: jk_bms
+    jk_bms_id: bms0
+    balancing:
+      id: st_balancing
+      name: "balancing"
+    # Состояние силовых ключей (MOSFET) заряда и разряда.
+    # Если BMS сама отключила ключ - это защита, шлём подробности в Telegram.
+    charging:
+      id: st_charging
+      name: "charging"
+      on_release:
+        then:
+          - lambda: |-
+              if (millis() < 60000) return;
+              char b[460];
+              snprintf(b, sizeof(b),
+                "⛔ BMS отключила ЗАРЯД\n"
+                "Заряд: %.0f%%, напряжение: %.2f В\n"
+                "Макс. ячейка: %.3f В (яч. %.0f)\n"
+                "Мин. ячейка: %.3f В (яч. %.0f)\n"
+                "Разброс: %.3f В\n"
+                "Температуры: MOSFET %.1f, датчики %.1f / %.1f °C\n"
+                "Ошибки: %s",
+                id(soc).state, id(vtotal).state,
+                id(cmax).state, id(cmax_n).state,
+                id(cmin).state, id(cmin_n).state,
+                id(delta).state,
+                id(mos_t).state, id(t1).state, id(t2).state,
+                id(errors_txt).state.empty() ? "не указаны" : id(errors_txt).state.c_str());
+              id(send_tg).execute(std::string(b));
+      on_press:
+        then:
+          - lambda: |-
+              if (millis() < 60000) return;
+              id(send_tg).execute("✅ BMS снова разрешила заряд");
+    discharging:
+      id: st_discharging
+      name: "discharging"
+      on_release:
+        then:
+          - lambda: |-
+              if (millis() < 60000) return;
+              char b[460];
+              snprintf(b, sizeof(b),
+                "⛔ BMS отключила РАЗРЯД\n"
+                "Заряд: %.0f%%, напряжение: %.2f В, ток: %.1f А\n"
+                "Мин. ячейка: %.3f В (яч. %.0f)\n"
+                "Макс. ячейка: %.3f В (яч. %.0f)\n"
+                "Температуры: MOSFET %.1f, датчики %.1f / %.1f °C\n"
+                "Ошибки: %s",
+                id(soc).state, id(vtotal).state, id(cur).state,
+                id(cmin).state, id(cmin_n).state,
+                id(cmax).state, id(cmax_n).state,
+                id(mos_t).state, id(t1).state, id(t2).state,
+                id(errors_txt).state.empty() ? "не указаны" : id(errors_txt).state.c_str());
+              id(send_tg).execute(std::string(b));
+      on_press:
+        then:
+          - lambda: |-
+              if (millis() < 60000) return;
+              id(send_tg).execute("✅ BMS снова разрешила разряд");
+
+sensor:
+  - platform: jk_bms
+    jk_bms_id: bms0
+
+    # --- Основное ---
+    total_voltage:
+      id: vtotal
+      name: "total voltage"
+      on_value:
+        then:
+          - lambda: id(last_ok) = millis();
+    current:
+      id: cur
+      name: "current"
+    power:
+      id: pwr
+      name: "power"
+    charging_power:
+      id: pwr_chg
+      name: "charging power"
+    discharging_power:
+      id: pwr_dis
+      name: "discharging power"
+    state_of_charge:
+      id: soc
+      name: "state of charge"
+      on_value:
+        then:
+          - lambda: |-
+              if (isnan(x)) return;
+              // первое значение после старта: просто запоминаем состояние, без уведомлений
+              if (!id(soc_init)) {
+                id(soc_init) = true;
+                id(f_low) = (x <= ${soc_low});
+                id(f_full) = (x >= ${soc_full});
+                return;
+              }
+              if (x <= ${soc_low} && !id(f_low)) {
+                id(f_low) = true;
+                id(send_tg).execute("🪫 Батарея разрядилась до " + std::to_string((int) x) + "% (порог ${soc_low}%)");
+              }
+              if (x >= ${soc_low_reset}) id(f_low) = false;
+              if (x >= ${soc_full} && !id(f_full)) {
+                id(f_full) = true;
+                id(send_tg).execute("🔋 Батарея заряжена: " + std::to_string((int) x) + "%");
+              }
+              if (x <= ${soc_full_reset}) id(f_full) = false;
+
+    # --- Ячейки ---
+    cell_voltage_1:
+      id: cv1
+      name: "cell voltage 1"
+    cell_voltage_2:
+      id: cv2
+      name: "cell voltage 2"
+    cell_voltage_3:
+      id: cv3
+      name: "cell voltage 3"
+    cell_voltage_4:
+      id: cv4
+      name: "cell voltage 4"
+    min_cell_voltage:
+      id: cmin
+      name: "min cell voltage"
+    max_cell_voltage:
+      id: cmax
+      name: "max cell voltage"
+    min_voltage_cell:
+      id: cmin_n
+      name: "min voltage cell"
+    max_voltage_cell:
+      id: cmax_n
+      name: "max voltage cell"
+    average_cell_voltage:
+      id: cavg
+      name: "average cell voltage"
+    delta_cell_voltage:
+      id: delta
+      name: "delta cell voltage"
+      on_value:
+        then:
+          - lambda: |-
+              if (isnan(x)) return;
+              if (x > ${delta_max} && !id(f_delta)) {
+                id(f_delta) = true;
+                char b[80];
+                snprintf(b, sizeof(b), "⚠️ Большой разброс ячеек: %.3f В (порог ${delta_max} В)", x);
+                id(send_tg).execute(std::string(b));
+              }
+              if (x < ${delta_max} - 0.05) id(f_delta) = false;
+
+    # --- Температуры ---
+    mosfet_temperature:
+      id: mos_t
+      name: "mosfet temperature"
+      on_value:
+        then:
+          - lambda: |-
+              if (isnan(x)) return;
+              if (x > ${mos_hot} && !id(f_mos_hot)) {
+                id(f_mos_hot) = true;
+                char b[80];
+                snprintf(b, sizeof(b), "🔥 Перегрев MOSFET: %.1f °C (порог ${mos_hot} °C)", x);
+                id(send_tg).execute(std::string(b));
+              }
+              if (x < ${mos_hot} - 5) id(f_mos_hot) = false;
+    temperature_sensor_1:
+      id: t1
+      name: "temperature sensor 1"
+      on_value:
+        then:
+          - lambda: |-
+              if (isnan(x)) return;
+              if (x > ${bat_hot} && !id(f_t1_hot)) {
+                id(f_t1_hot) = true;
+                char b[90];
+                snprintf(b, sizeof(b), "🔥 Перегрев батареи (датчик 1): %.1f °C (порог ${bat_hot} °C)", x);
+                id(send_tg).execute(std::string(b));
+              }
+              if (x < ${bat_hot} - 5) id(f_t1_hot) = false;
+    temperature_sensor_2:
+      id: t2
+      name: "temperature sensor 2"
+      on_value:
+        then:
+          - lambda: |-
+              if (isnan(x)) return;
+              if (x > ${bat_hot} && !id(f_t2_hot)) {
+                id(f_t2_hot) = true;
+                char b[90];
+                snprintf(b, sizeof(b), "🔥 Перегрев батареи (датчик 2): %.1f °C (порог ${bat_hot} °C)", x);
+                id(send_tg).execute(std::string(b));
+              }
+              if (x < ${bat_hot} - 5) id(f_t2_hot) = false;
+
+    # --- Статистика ---
+    charging_cycles:
+      id: cycles
+      name: "charging cycles"
+    total_charging_cycle_capacity:
+      id: cycles_cap
+      name: "total charging cycle capacity"
+    total_runtime:
+      name: "total runtime"
+
+  # Сглаженный ток для расчёта времени (убирает скачки)
+  - platform: copy
+    source_id: cur
+    id: cur_avg
+    internal: true
+    filters:
+      - sliding_window_moving_average:
+          window_size: 6
+          send_every: 1
+
+  # Время до полного разряда, часы (только при разряде)
+  - platform: template
+    id: h_empty
+    name: "hours to empty"
+    unit_of_measurement: "h"
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: |-
+      float i = id(cur_avg).state;
+      if (isnan(i) || i > -0.2f) return NAN;
+      if (isnan(id(soc).state)) return NAN;
+      float rem = id(soc).state / 100.0f * ${capacity_ah};
+      return rem / (-i);
+
+  # Время до полного заряда, часы (только при заряде)
+  - platform: template
+    id: h_full
+    name: "hours to full"
+    unit_of_measurement: "h"
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: |-
+      float i = id(cur_avg).state;
+      if (isnan(i) || i < 0.2f) return NAN;
+      if (isnan(id(soc).state)) return NAN;
+      float cap = ${capacity_ah};
+      float need = cap - id(soc).state / 100.0f * cap;
+      if (need < 0) need = 0;
+      return need / i;
+
+text_sensor:
+  - platform: jk_bms
+    jk_bms_id: bms0
+    errors:
+      id: errors_txt
+      name: "errors"
+      on_value:
+        then:
+          - lambda: |-
+              if (x == id(last_err)) return;
+              std::string prev = id(last_err);
+              id(last_err) = x;
+              if (!x.empty()) {
+                id(send_tg).execute("🚨 Защита BMS: " + x);
+              } else if (!prev.empty()) {
+                id(send_tg).execute("✅ Защита BMS снята");
+              }
+    total_runtime_formatted:
+      id: runtime_fmt
+      name: "total runtime formatted"
+
+  # Время до разряда в виде "3 ч 20 мин"
+  - platform: template
+    id: t_empty
+    name: "time to empty"
+    update_interval: 10s
+    lambda: |-
+      float i = id(cur_avg).state;
+      if (isnan(i)) return std::string("нет данных");
+      if (i >= 0.2f) return std::string("идёт заряд");
+      if (i > -0.2f) return std::string("нагрузки нет");
+      float h = id(h_empty).state;
+      if (isnan(h)) return std::string("нет данных");
+      int m = (int) roundf(h * 60.0f);
+      char b[32];
+      snprintf(b, sizeof(b), "%d ч %02d мин", m / 60, m % 60);
+      return std::string(b);
+
+  # Время до заряда в виде "1 ч 05 мин"
+  - platform: template
+    id: t_full
+    name: "time to full"
+    update_interval: 10s
+    lambda: |-
+      float i = id(cur_avg).state;
+      if (isnan(i)) return std::string("нет данных");
+      if (i <= -0.2f) return std::string("идёт разряд");
+      if (i < 0.2f) return std::string("заряда нет");
+      float h = id(h_full).state;
+      if (isnan(h)) return std::string("нет данных");
+      int m = (int) roundf(h * 60.0f);
+      char b[32];
+      snprintf(b, sizeof(b), "%d ч %02d мин", m / 60, m % 60);
+      return std::string(b);
