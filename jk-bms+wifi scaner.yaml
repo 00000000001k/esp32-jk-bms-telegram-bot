@@ -1,0 +1,316 @@
+substitutions:
+  tg_token: 
+  tg_chat_id: 
+
+esphome:
+  name: jk-bms
+  friendly_name: JK-BMS
+  # подключаем заголовок ESP-IDF для сканирования Wi-Fi (отдельный файл не нужен)
+  includes:
+    - <esp_wifi.h>
+  on_boot:
+    priority: -100
+    then:
+      - delay: 30s
+      - script.execute:
+          id: send_tg
+          msg: "✅ ESP32 запущена. Нажми кнопку «📊 Опросить BMS» или «📡 Сканер Wi-Fi» внизу."
+ 
+esp32:
+  variant: esp32
+  framework:
+    type: esp-idf
+ 
+external_components:
+  - source: github://syssi/esphome-jk-bms@main
+    refresh: 0s
+ 
+logger:
+  level: INFO
+ 
+api:
+  reboot_timeout: 0s
+ 
+ota:
+  - platform: esphome
+ 
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  use_address: 192.168.0.101
+  reboot_timeout: 0s
+ 
+http_request:
+  verify_ssl: false
+  timeout: 15s
+  watchdog_timeout: 25s
+ 
+uart:
+  - id: uart_0
+    baud_rate: 115200
+    tx_pin: GPIO25
+    rx_pin: GPIO26
+    rx_buffer_size: 384
+ 
+jk_modbus:
+  - id: modbus0
+    uart_id: uart_0
+    rx_timeout: 50ms
+ 
+jk_bms:
+  - id: bms0
+    jk_modbus_id: modbus0
+    update_interval: 10s
+ 
+globals:
+  - id: last_ok
+    type: uint32_t
+    initial_value: '0'
+  # следующий update_id для getUpdates
+  - id: tg_offset
+    type: int
+    initial_value: '0'
+  # true до первого успешного опроса: старые сообщения не обрабатываем
+  - id: tg_first
+    type: bool
+    initial_value: 'true'
+ 
+script:
+  # Отправка текста в Telegram (с постоянными кнопками внизу чата)
+  - id: send_tg
+    mode: queued
+    parameters:
+      msg: string
+    then:
+      - http_request.post:
+          url: !lambda |-
+            return std::string("https://api.telegram.org/bot") + "${tg_token}" + "/sendMessage?chat_id=" + "${tg_chat_id}";
+          request_headers:
+            Content-Type: application/json
+          json: |-
+            root["text"] = msg;
+            JsonObject rm = root["reply_markup"].to<JsonObject>();
+            JsonArray kb = rm["keyboard"].to<JsonArray>();
+            JsonArray row = kb.add<JsonArray>();
+            JsonObject btn1 = row.add<JsonObject>();
+            btn1["text"] = "📊 Опросить BMS";
+            JsonObject btn2 = row.add<JsonObject>();
+            btn2["text"] = "📡 Сканер Wi-Fi";
+            rm["resize_keyboard"] = true;
+            rm["is_persistent"] = true;
+          on_response:
+            then:
+              - lambda: |-
+                  ESP_LOGI("tg", "sendMessage ответ: %d", response->status_code);
+ 
+  # Собирает отчёт по BMS и отправляет в Telegram
+  - id: send_status
+    mode: single
+    then:
+      - script.execute:
+          id: send_tg
+          msg: !lambda |-
+            if (!id(bms_online).state || isnan(id(soc).state)) {
+              return std::string("⚠️ Нет связи с BMS");
+            }
+            char buf[400];
+            snprintf(buf, sizeof(buf),
+              "🔋 JK-BMS 4S\nЗаряд: %.0f%%\nНапряжение: %.2f В\nТок: %.2f А\n"
+              "Ячейки: %.3f – %.3f В (разброс %.3f В)\nТемп. MOSFET: %.1f °C\nЦиклов: %.0f",
+              id(soc).state, id(vtotal).state, id(cur).state,
+              id(cmin).state, id(cmax).state, id(delta).state,
+              id(mos_t).state, id(cycles).state);
+            return std::string(buf);
+ 
+  # Отчёт по Wi-Fi: сеть, уровень сигнала в дБм, точка доступа
+  - id: send_wifi
+    mode: single
+    then:
+      - script.execute:
+          id: send_tg
+          msg: !lambda |-
+            // своя сеть: имя и сигнал напрямую из ESP-IDF
+            std::string my_ssid;
+            int my_rssi = 0;
+            wifi_ap_record_t cur_ap = {};
+            if (esp_wifi_sta_get_ap_info(&cur_ap) == ESP_OK) {
+              my_ssid = reinterpret_cast<const char *>(cur_ap.ssid);
+              my_rssi = cur_ap.rssi;
+            }
+            auto qual = [](int r) -> const char * {
+              if (r >= -50) return "🟢 отлично";
+              if (r >= -60) return "🟢 хорошо";
+              if (r >= -70) return "🟡 нормально";
+              if (r >= -80) return "🟠 слабо";
+              return "🔴 очень плохо";
+            };
+            std::string out = "📡 Сканер Wi-Fi\n";
+            char line[160];
+            if (my_rssi < 0 && my_rssi > -127) {
+              snprintf(line, sizeof(line), "Моя сеть: %s, %d дБм (%s)\n\n",
+                       my_ssid.c_str(), my_rssi, qual(my_rssi));
+              out += line;
+            } else {
+              out += "\n";
+            }
+            // блокирующее сканирование всех каналов, занимает 2–3 секунды
+            wifi_scan_config_t scan_cfg = {};
+            scan_cfg.show_hidden = true;
+            if (esp_wifi_scan_start(&scan_cfg, true) != ESP_OK) {
+              return out + "⚠️ Не удалось выполнить сканирование";
+            }
+            uint16_t n = 0;
+            esp_wifi_scan_get_ap_num(&n);
+            if (n == 0) return out + "Сети не найдены";
+            if (n > 25) n = 25;
+            std::vector<wifi_ap_record_t> recs(n);
+            esp_wifi_scan_get_ap_records(&n, recs.data());
+            recs.resize(n);
+            std::sort(recs.begin(), recs.end(),
+                      [](const wifi_ap_record_t &a, const wifi_ap_record_t &b) {
+                        return a.rssi > b.rssi;
+                      });
+            snprintf(line, sizeof(line), "Найдено сетей: %u\n", (unsigned) n);
+            out += line;
+            int i = 1;
+            for (const auto &r : recs) {
+              const char *name = reinterpret_cast<const char *>(r.ssid);
+              if (name[0] == '\0') name = "(скрытая)";
+              const char *mine = (!my_ssid.empty() && my_ssid == name) ? " ✅" : "";
+              snprintf(line, sizeof(line), "%d. %s%s\n    %d дБм, %s, канал %d\n",
+                       i++, name, mine, r.rssi, qual(r.rssi), r.primary);
+              out += line;
+            }
+            return out;
+ 
+interval:
+  # Автоотчёт раз в 30 минут
+  - interval: 30min
+    then:
+      - script.execute: send_status
+ 
+  # Опрос Telegram: нажал ли ты кнопку / отправил команду
+  - interval: 6s
+    then:
+      - if:
+          condition:
+            wifi.connected:
+          then:
+            - http_request.get:
+                url: !lambda |-
+                  return std::string("https://api.telegram.org/bot") + "${tg_token}" + "/getUpdates?timeout=0&limit=3&offset=" + std::to_string(id(tg_offset));
+                capture_response: true
+                max_response_buffer_size: 4096
+                on_response:
+                  then:
+                    - lambda: |-
+                        if (response->status_code != 200) {
+                          ESP_LOGW("tg", "getUpdates ответ: %d", response->status_code);
+                          return;
+                        }
+                        bool want_status = false;
+                        bool want_wifi = false;
+                        json::parse_json(body, [&want_status, &want_wifi](JsonObject root) -> bool {
+                          if (!root["ok"].as<bool>()) return false;
+                          for (JsonObject upd : root["result"].as<JsonArray>()) {
+                            int uid = upd["update_id"] | 0;
+                            if (uid >= id(tg_offset)) id(tg_offset) = uid + 1;
+                            // только сообщения из твоего чата
+                            long long chat = upd["message"]["chat"]["id"] | 0LL;
+                            if (std::to_string(chat) != "${tg_chat_id}") continue;
+                            const char *text = upd["message"]["text"] | "";
+                            if (strstr(text, "Опросить") != nullptr ||
+                                strncmp(text, "/status", 7) == 0 ||
+                                strncmp(text, "/start", 6) == 0) {
+                              want_status = true;
+                            }
+                            if (strstr(text, "Wi-Fi") != nullptr ||
+                                strncmp(text, "/wifi", 5) == 0) {
+                              want_wifi = true;
+                            }
+                          }
+                          return true;
+                        });
+                        // при первом опросе пропускаем старые сообщения
+                        if (id(tg_first)) {
+                          id(tg_first) = false;
+                          return;
+                        }
+                        if (want_status) {
+                          id(send_status).execute();
+                        }
+                        if (want_wifi) {
+                          id(send_wifi).execute();
+                        }
+ 
+binary_sensor:
+  - platform: template
+    id: bms_online
+    name: "online status"
+    lambda: |-
+      if (id(last_ok) == 0) return false;
+      return (millis() - id(last_ok)) < 120000;
+    on_press:
+      then:
+        - script.execute:
+            id: send_tg
+            msg: "✅ Связь с BMS установлена"
+    on_release:
+      then:
+        - script.execute:
+            id: send_tg
+            msg: "⚠️ Связь с BMS потеряна"
+ 
+sensor:
+  # Уровень сигнала Wi-Fi в Home Assistant
+  - platform: wifi_signal
+    name: "wifi signal"
+    update_interval: 60s
+ 
+  - platform: jk_bms
+    jk_bms_id: bms0
+    total_voltage:
+      id: vtotal
+      name: "total voltage"
+      on_value:
+        then:
+          - lambda: id(last_ok) = millis();
+    current:
+      id: cur
+      name: "current"
+    state_of_charge:
+      id: soc
+      name: "state of charge"
+      on_value_range:
+        - below: 20
+          then:
+            - script.execute:
+                id: send_tg
+                msg: "🪫 Заряд батареи ниже 20%"
+    min_cell_voltage:
+      id: cmin
+      name: "min cell voltage"
+    max_cell_voltage:
+      id: cmax
+      name: "max cell voltage"
+    delta_cell_voltage:
+      id: delta
+      name: "delta cell voltage"
+      on_value_range:
+        - above: 0.15
+          then:
+            - script.execute:
+                id: send_tg
+                msg: "⚠️ Большой разброс напряжения ячеек (>0.15 В)"
+    power_tube_temperature:
+      id: mos_t
+      name: "mosfet temperature"
+      on_value_range:
+        - above: 60
+          then:
+            - script.execute:
+                id: send_tg
+                msg: "🔥 Перегрев MOSFET (>60 °C)"
+    charging_cycles:
+      id: cycles
+      name: "charging cycles"
